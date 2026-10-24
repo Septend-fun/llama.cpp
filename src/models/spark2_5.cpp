@@ -67,6 +67,8 @@ llama_model_spark2_5::graph::graph(const llama_model & model, const llm_graph_pa
     const float kq_scale = 1.0f / sqrtf(float(n_embd_head));
 
     for (int il = 0; il < n_layer; ++il) {
+        res->t_layer_inp[il] = inpL;
+
         ggml_tensor * inpSA = inpL;
         ggml_tensor * cur = build_norm(inpL, model.layers[il].attn_norm, nullptr, LLM_NORM_RMS, il);
         cb(cur, "attn_norm", il);
@@ -134,6 +136,7 @@ llama_model_spark2_5::graph::graph(const llama_model & model, const llm_graph_pa
         inpL = cur;
     }
 
+    res->t_layer_inp[n_layer] = inpL;
     ggml_tensor * cur = build_norm(inpL, model.output_norm, nullptr, LLM_NORM_RMS, -1);
     cb(cur, "result_norm", -1);
     res->t_embd = cur;
