@@ -63,6 +63,7 @@ llama_model_spark2_5::graph::graph(const llama_model & model, const llm_graph_pa
     ggml_tensor * inp_pos = build_inp_pos();
     auto * inp_attn = build_attn_inp_kv_iswa();
     ggml_tensor * inp_out_ids = build_inp_out_ids();
+    const bool extract_final_inp = (size_t) n_layer < cparams.embeddings_layer_inp.size() && cparams.embeddings_layer_inp[n_layer];
 
     const float kq_scale = 1.0f / sqrtf(float(n_embd_head));
 
@@ -110,7 +111,7 @@ llama_model_spark2_5::graph::graph(const llama_model & model, const llm_graph_pa
         cur = build_lora_mm(model.layers[il].wo, cur, model.layers[il].wo_s);
         cb(cur, "attn_out_proj", il);
 
-        if (il == n_layer - 1 && inp_out_ids) {
+        if (il == n_layer - 1 && inp_out_ids && !extract_final_inp) {
             cur = ggml_get_rows(ctx0, cur, inp_out_ids);
             inpSA = ggml_get_rows(ctx0, inpSA, inp_out_ids);
         }
@@ -137,6 +138,9 @@ llama_model_spark2_5::graph::graph(const llama_model & model, const llm_graph_pa
     }
 
     res->t_layer_inp[n_layer] = inpL;
+    if (extract_final_inp && inp_out_ids) {
+        inpL = ggml_get_rows(ctx0, inpL, inp_out_ids);
+    }
     ggml_tensor * cur = build_norm(inpL, model.output_norm, nullptr, LLM_NORM_RMS, -1);
     cb(cur, "result_norm", -1);
     res->t_embd = cur;
