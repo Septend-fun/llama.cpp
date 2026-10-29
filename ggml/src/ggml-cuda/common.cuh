@@ -1267,9 +1267,14 @@ struct ggml_cuda_graph {
         for (cudaGraphExec_t instance : instances) {
             CUDA_CHECK(cudaGraphExecDestroy(instance));
         }
+        for (cudaGraph_t source : sources) {
+            CUDA_CHECK(cudaGraphDestroy(source));
+        }
     }
     // the ggml graph is captured as a series of CUDA graphs, so the GPU can run one chunk while the next is enqueued
     std::vector<cudaGraphExec_t> instances;
+    std::vector<cudaGraph_t> sources;
+    std::vector<uint64_t> source_ids;
     size_t num_nodes = 0;
     std::vector<cudaGraphNode_t> nodes;
     bool disable_due_to_gpu_arch = false;

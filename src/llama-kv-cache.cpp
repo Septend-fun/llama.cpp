@@ -2894,6 +2894,10 @@ ggml_type llama_kv_cache_context::type_k() const {
     return kv->type_k();
 }
 
+bool llama_kv_cache_context::is_swa() const {
+    return kv->is_swa();
+}
+
 ggml_type llama_kv_cache_context::type_v() const {
     return kv->type_v();
 }

@@ -82,6 +82,7 @@ struct common_speculative_draft_params {
     uint32_t seed = LLAMA_DEFAULT_SEED;
 
     bool probs_device = false;
+    bool tokens_device = false;
 };
 
 common_speculative_draft_params & common_speculative_get_draft_params(common_speculative * spec, llama_seq_id seq_id);

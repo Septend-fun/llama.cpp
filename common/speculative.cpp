@@ -1028,6 +1028,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     // dspark speculators
     bool sample_from_anchor = true;
     bool dspark_probabilistic = false;
+    bool device_features = false;
     // block-internal attention
     bool causal_attn = false;
 
@@ -1159,6 +1160,14 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             llama_set_embeddings_layer_inp(ctx_tgt, (uint32_t) target_layer_ids[k], true);
         }
 
+        const char * feature_mode = std::getenv("DSPARK_DEVICE_FEATURES");
+        if (is_dspark && n_seq == 1 && (!feature_mode || std::strcmp(feature_mode, "0") != 0) &&
+                llama_supports_gpu_sampling(ctx_tgt) &&
+                llama_model_get_device(model_tgt, 0) == llama_model_get_device(model_dft, 0)) {
+            device_features = llama_set_layer_inputs_device(ctx_tgt,
+                    {target_layer_ids, target_layer_ids + target_layer_ids_n});
+        }
+
         // DFlash2 reads its selector lattice from h_nextn and never consumes raw logits.
         llama_set_embeddings_nextn(ctx_dft, !dspark_probabilistic, /*masked*/ !is_dflash2 && !is_lilicorr);
         llama_set_causal_attn(ctx_dft, causal_attn); // DFlash needs non-causal attention unless the model says otherwise
@@ -1166,6 +1175,9 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
     ~common_speculative_impl_draft_dflash() override {
         auto * ctx_dft = this->params.ctx_dft;
+        if (device_features) {
+            llama_set_layer_inputs_device(params.ctx_tgt, {});
+        }
         if (ctx_dft && dspark_probabilistic) {
             llama_set_dspark_probabilistic(ctx_dft, false);
         }
@@ -1276,6 +1288,31 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         auto * ctx_dft = this->params.ctx_dft;
 
         const int32_t n_ubatch = (int32_t) llama_n_ubatch(ctx_dft);
+
+        ggml_backend_t features_backend = nullptr;
+        auto * features_device = device_features && has_tokens
+            ? llama_get_layer_inputs_device(ctx_tgt, n_tokens, features_backend) : nullptr;
+        if (features_device) {
+            for (int32_t offset = 0; offset < n_tokens; offset += n_ubatch) {
+                const int32_t count = std::min(n_ubatch, n_tokens - offset);
+                batch_inject.clear();
+                for (int32_t row = 0; row < count; ++row) {
+                    const auto & token = batch_in.tokens[offset + row];
+                    batch_inject.add(0, token.pos[0], token.seq_id, false);
+                }
+                ggml_tensor slice = *features_device;
+                slice.ne[1] = count;
+                slice.nb[2] = slice.nb[1] * count;
+                slice.nb[3] = slice.nb[2];
+                slice.data = (char *) slice.data + (size_t) offset * slice.nb[1];
+                auto * input = batch_inject.get();
+                if (!llama_batch_ext_set_embd_device(input, &slice, features_backend) ||
+                        llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, input) != 0) {
+                    return false;
+                }
+            }
+            return true;
+        }
 
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
             if (i_batch_beg[seq_id] < 0) {
@@ -1399,6 +1436,8 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             backend_chains[0] && dparams[0].probs_device && dparams[0].result_q;
         dparams[0].probs_device = probs_device;
         llama_set_probs_device(ctx_dft, probs_device);
+        bool tokens_device = probs_device && dparams[0].tokens_device;
+        llama_set_tokens_device(ctx_dft, tokens_device);
 
         // decode all sequence's noise block in a single batch
         int ret = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch.get());
@@ -1409,6 +1448,10 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
         probs_device = probs_device && llama_get_probs_device(ctx_dft) != nullptr;
         dparams[0].probs_device = probs_device;
+
+        ggml_backend_t tokens_backend = nullptr;
+        tokens_device = tokens_device && llama_get_tokens_device(ctx_dft, tokens_backend) != nullptr;
+        dparams[0].tokens_device = tokens_device;
 
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
             if (i_block_beg[seq_id] < 0) {
@@ -1513,7 +1556,9 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     }
 
                     llama_token id;
-                    if (probs_device) {
+                    if (tokens_device) {
+                        id = 0; // The target input reads the real ID from the device tensor.
+                    } else if (probs_device) {
                         id = llama_get_sampled_token_ith(ctx_dft, idx);
                     } else if (dspark_probabilistic) {
                         id = common_sampler_sample(smpl, ctx_dft, idx, true);
@@ -1523,7 +1568,9 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     }
 
                     const auto * cur_p = probs_device ? nullptr : common_sampler_get_candidates(smpl, false);
-                    common_sampler_accept(smpl, id, true);
+                    if (!tokens_device) {
+                        common_sampler_accept(smpl, id, true);
+                    }
                     if (dspark_probabilistic && backend_chains[seq_id]) {
                         llama_sampler_accept(backend_chains[seq_id], id);
                     }

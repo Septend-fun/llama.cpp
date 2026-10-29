@@ -185,9 +185,23 @@ LLAMA_API bool llama_supports_gpu_sampling(struct llama_context * ctx);
 LLAMA_API bool llama_sample_gpu(struct llama_context * ctx, struct llama_context * draft,
         const std::vector<int> & idxs, struct ggml_sample_params params, struct ggml_sample_result & result);
 LLAMA_API void llama_set_probs_device(struct llama_context * ctx, bool value);
+LLAMA_API void llama_set_tokens_device(struct llama_context * ctx, bool value);
+LLAMA_API struct ggml_tensor * llama_get_tokens_device(struct llama_context * ctx, ggml_backend_t & backend);
 LLAMA_API void llama_set_logits_device(struct llama_context * ctx, bool value);
 // Retained until the next device-probability draft batch or context destruction.
 LLAMA_API struct ggml_tensor * llama_get_probs_device(struct llama_context * ctx);
+
+LLAMA_API bool llama_set_layer_inputs_device(struct llama_context * ctx, const std::vector<int32_t> & layers);
+LLAMA_API bool llama_set_device_embeddings(struct llama_context * ctx, bool value);
+LLAMA_API bool llama_device_embeddings_ready(struct llama_context * ctx);
+LLAMA_API void llama_share_device_embeddings(struct llama_context * ctx, struct llama_context * target);
+LLAMA_API bool llama_pipeline_begin(struct llama_context * ctx, struct llama_context * draft);
+LLAMA_API bool llama_pipeline_active(struct llama_context * ctx);
+LLAMA_API void llama_pipeline_finish(struct llama_context * ctx);
+// Valid until the next evaluation on ctx; the caller keeps ctx alive until the copy finishes.
+LLAMA_API struct ggml_tensor * llama_get_layer_inputs_device(struct llama_context * ctx, uint32_t n_tokens, ggml_backend_t & backend);
+LLAMA_API bool llama_batch_ext_set_embd_device(struct llama_batch_ext * batch, struct ggml_tensor * tensor, ggml_backend_t backend);
+LLAMA_API bool llama_batch_ext_set_tokens_device(struct llama_batch_ext * batch, struct ggml_tensor * tensor, ggml_backend_t backend, uint32_t begin);
 
 // Read DSpark Markov weights as F32. Passing nullptr returns the element count.
 LLAMA_API uint32_t llama_model_get_dspark_markov_w1(const struct llama_model * model, float * out);

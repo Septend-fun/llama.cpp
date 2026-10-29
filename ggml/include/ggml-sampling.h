@@ -15,6 +15,7 @@ struct ggml_sample_params {
     float top_p;
     int32_t min_keep;
     bool temperature_first;
+    bool draft_on_device;
     int32_t n_bias;
     int32_t bias_ids[GGML_SAMPLE_MAX_BIAS];
     float bias_values[GGML_SAMPLE_MAX_BIAS];
@@ -27,5 +28,9 @@ struct ggml_sample_result {
 };
 
 typedef bool (*ggml_backend_sample_t)(ggml_backend_t backend,
-        const struct ggml_tensor * logits, const struct ggml_tensor * draft_probs,
+        const struct ggml_tensor * logits, const struct ggml_tensor * draft_probs, const struct ggml_tensor * draft_tokens,
         const struct ggml_sample_params * params, struct ggml_sample_result * result);
+
+typedef bool (*ggml_backend_pipeline_begin_t)(ggml_backend_t target, ggml_backend_t draft);
+typedef bool (*ggml_backend_pipeline_active_t)(ggml_backend_t backend);
+typedef void (*ggml_backend_pipeline_finish_t)(ggml_backend_t backend);

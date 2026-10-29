@@ -676,12 +676,13 @@ bool common_sampler_can_gpu(const common_sampler * gsmpl, llama_context * ctx) {
 }
 
 static bool common_sampler_gpu(common_sampler * gsmpl, llama_context * ctx, llama_context * draft_ctx,
-        const std::vector<int> & idxs, const llama_tokens & draft, std::vector<llama_token> & tokens) {
+        const std::vector<int> & idxs, const llama_tokens & draft, std::vector<llama_token> & tokens, bool tokens_device = false) {
     ggml_sample_params params = {};
     if (draft.size() > GGML_SAMPLE_MAX_DRAFT || !common_sampler_gpu_params(gsmpl, ctx, params)) {
         return false;
     }
     params.n_draft = draft.size();
+    params.draft_on_device = tokens_device;
     std::copy(draft.begin(), draft.end(), params.draft);
     auto rng = gsmpl->rng;
     std::uniform_real_distribution<float> uni(0.0f, 1.0f);
@@ -847,15 +848,24 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
 // Accept a drafted token with probability min(1, p/q), else draw from norm(max(0, p - q)).
 // Preserves the target distribution exactly, and accepts more often than matching does when the
 // draft samples instead of taking its argmax.
-std::vector<llama_token> common_sampler_sample_and_accept_n_rejection(struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const llama_tokens & draft, const std::vector<std::vector<llama_token_data>> & draft_q, bool grammar_first, struct llama_context * draft_ctx) {
+std::vector<llama_token> common_sampler_sample_and_accept_n_rejection(struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const llama_tokens & draft, const std::vector<std::vector<llama_token_data>> & draft_q, bool grammar_first, struct llama_context * draft_ctx, bool tokens_device) {
     GGML_ASSERT(idxs.size()    == draft.size() + 1 && "idxs.size() must be draft.size() + 1");
     if (draft_ctx) {
         std::vector<llama_token> tokens;
-        if (common_sampler_gpu(gsmpl, ctx, draft_ctx, idxs, draft, tokens)) {
+        if (common_sampler_gpu(gsmpl, ctx, draft_ctx, idxs, draft, tokens, tokens_device)) {
             for (auto id : tokens) {
                 common_sampler_accept(gsmpl, id, true);
             }
             return tokens;
+        }
+        if (tokens_device) {
+            ggml_backend_t backend = nullptr;
+            auto * source = llama_get_tokens_device(draft_ctx, backend);
+            GGML_ASSERT(source && ggml_nelements(source) >= (int64_t) draft.size());
+            llama_synchronize(draft_ctx);
+            llama_tokens actual(draft.size());
+            ggml_backend_tensor_get(source, actual.data(), 0, actual.size() * sizeof(llama_token));
+            return common_sampler_sample_and_accept_n_rejection(gsmpl, ctx, idxs, actual, draft_q, grammar_first, draft_ctx);
         }
         if (draft_q.empty()) {
             std::vector<std::vector<llama_token_data>> q;

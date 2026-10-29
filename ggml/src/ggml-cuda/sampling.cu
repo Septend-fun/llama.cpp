@@ -1,4 +1,5 @@
 #include "sampling.cuh"
+#include "pipeline.cuh"
 
 #ifdef GGML_CUDA_USE_CUB
 #include <cub/cub.cuh>
@@ -8,6 +9,7 @@ struct sample_input {
     ggml_sample_params params;
     const float * logits;
     const float * q;
+    const int32_t * draft;
 };
 
 struct ggml_cuda_sampling_context {
@@ -20,6 +22,7 @@ struct ggml_cuda_sampling_context {
     sample_input * input = nullptr;
     ggml_sample_result * output = nullptr;
     std::map<int, std::pair<cudaGraph_t, cudaGraphExec_t>> graphs;
+    std::map<int, uint64_t> graph_ids;
 
     explicit ggml_cuda_sampling_context(int device) : device(device) {}
     ~ggml_cuda_sampling_context() { clear(); }
@@ -30,6 +33,7 @@ struct ggml_cuda_sampling_context {
             CUDA_CHECK(cudaGraphDestroy(entry.second.first));
         }
         graphs.clear();
+        graph_ids.clear();
         CUDA_CHECK(cudaFree(storage));
         CUDA_CHECK(cudaFree(workspace));
         CUDA_CHECK(cudaFree(input));
@@ -92,7 +96,8 @@ static __global__ void sample_residual(const float * p_weights, const float * cd
     const int offset = row * n_vocab;
     const float total = cdf[offset + n_vocab - 1];
     const float p = p_weights[offset + col] / total;
-    if (ids[offset + col] == params.draft[row]) {
+    const int token = input->draft ? input->draft[row] : params.draft[row];
+    if (ids[offset + col] == token) {
         p_selected[row] = p;
     }
     weights[offset + col] = fmaxf(0.0f, p - q[((int64_t) params.q_row + row) * n_vocab + ids[offset + col]]);
@@ -125,7 +130,10 @@ static __global__ void sample_finish(const float * p_selected, const float * cdf
     }
     int row = 0;
     for (; row < params.n_draft; ++row) {
-        const int token = params.draft[row];
+        const int token = input->draft ? input->draft[row] : params.draft[row];
+        if (token < 0 || token >= n_vocab) {
+            return;
+        }
         const float q_x = q[((int64_t) params.q_row + row) * n_vocab + token];
         if (!(q_x > 0.0f && params.uniforms[row] < fminf(1.0f, p_selected[row] / q_x))) {
             break;
@@ -142,9 +150,9 @@ static __global__ void sample_finish(const float * p_selected, const float * cdf
 #endif
 
 bool ggml_cuda_sample(ggml_backend_cuda_context & ctx, const ggml_tensor * logits,
-        const ggml_tensor * draft_probs, const ggml_sample_params * params, ggml_sample_result * result) {
+        const ggml_tensor * draft_probs, const ggml_tensor * draft_tokens, const ggml_sample_params * params, ggml_sample_result * result) {
 #ifndef GGML_CUDA_USE_CUB
-    GGML_UNUSED(ctx); GGML_UNUSED(logits); GGML_UNUSED(draft_probs); GGML_UNUSED(params); GGML_UNUSED(result);
+    GGML_UNUSED(ctx); GGML_UNUSED(logits); GGML_UNUSED(draft_probs); GGML_UNUSED(draft_tokens); GGML_UNUSED(params); GGML_UNUSED(result);
     return false;
 #else
     if (!logits || !params || !result || logits->type != GGML_TYPE_F32 || !ggml_is_contiguous(logits) ||
@@ -171,8 +179,12 @@ bool ggml_cuda_sample(ggml_backend_cuda_context & ctx, const ggml_tensor * logit
                 (int64_t) params->q_row + params->n_draft > draft_probs->ne[1]) {
             return false;
         }
+        if (draft_tokens && (draft_tokens->type != GGML_TYPE_I32 || !ggml_is_contiguous(draft_tokens) ||
+                ggml_nelements(draft_tokens) < params->n_draft)) {
+            return false;
+        }
         for (int row = 0; row < params->n_draft; ++row) {
-            if (params->draft[row] < 0 || params->draft[row] >= n_vocab) {
+            if (!draft_tokens && (params->draft[row] < 0 || params->draft[row] >= n_vocab)) {
                 return false;
             }
         }
@@ -227,6 +239,7 @@ bool ggml_cuda_sample(ggml_backend_cuda_context & ctx, const ggml_tensor * logit
             CUDA_CHECK(cudaGraphDestroy(entry.second.first));
         }
         state.graphs.clear();
+        state.graph_ids.clear();
         CUDA_CHECK(cudaFree(state.workspace));
         state.workspace = nullptr;
     }
@@ -234,7 +247,8 @@ bool ggml_cuda_sample(ggml_backend_cuda_context & ctx, const ggml_tensor * logit
         state.workspace_size = std::max(scan_size, sort_size);
         CUDA_CHECK(cudaMalloc(&state.workspace, state.workspace_size));
     }
-    sample_input input = {*params, (const float *) logits->data, draft_probs ? (const float *) draft_probs->data : nullptr};
+    sample_input input = {*params, (const float *) logits->data, draft_probs ? (const float *) draft_probs->data : nullptr,
+        draft_tokens ? (const int32_t *) draft_tokens->data : nullptr};
     CUDA_CHECK(cudaMemcpyAsync(state.input, &input, sizeof(input), cudaMemcpyHostToDevice, stream));
     if (!use_graphs || !state.graphs.count(n_rows)) {
         if (use_graphs) {
@@ -269,10 +283,15 @@ bool ggml_cuda_sample(ggml_backend_cuda_context & ctx, const ggml_tensor * logit
             CUDA_CHECK(cudaStreamEndCapture(stream, &graph));
             CUDA_CHECK(cudaGraphInstantiate(&executable, graph, nullptr, nullptr, 0));
             state.graphs[n_rows] = {graph, executable};
+            state.graph_ids[n_rows] = ggml_cuda_pipeline_graph_id();
         }
     }
     if (use_graphs) {
-        CUDA_CHECK(cudaGraphLaunch(state.graphs.at(n_rows).second, stream));
+        if (ggml_cuda_pipeline_graph(&ctx, state.graphs.at(n_rows).first, state.graph_ids.at(n_rows))) {
+            ggml_cuda_pipeline_finish(&ctx);
+        } else {
+            CUDA_CHECK(cudaGraphLaunch(state.graphs.at(n_rows).second, stream));
+        }
     }
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaMemcpyAsync(result, state.output, sizeof(*result), cudaMemcpyDeviceToHost, stream));

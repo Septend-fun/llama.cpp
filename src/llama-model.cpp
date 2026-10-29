@@ -3349,6 +3349,7 @@ ggml_cgraph * llama_model::build_graph(const llm_graph_params & params) const {
 
     // add the LM head (if the context outputs logits)
     llm->build_logits();
+    llm->build_layer_inputs();
 
     // add backend sampling layers (if any)
     llm->build_sampling();

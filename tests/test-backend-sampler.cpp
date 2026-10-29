@@ -1816,6 +1816,82 @@ static void test_multi_output_multi_sequence_dist_impl(const test_params & param
     printf("backend multi-sequence multi-output dist test PASSED\n");
 }
 
+static void test_device_inputs(const test_params & params) {
+    auto * device = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
+    if (!device) {
+        return;
+    }
+    ggml_backend_ptr backend(ggml_backend_dev_init(device, nullptr));
+    ggml_context_ptr tensors(ggml_init({ggml_tensor_overhead(), nullptr, true}));
+    auto * token_ids = ggml_new_tensor_1d(tensors.get(), GGML_TYPE_I32, 6);
+    ggml_backend_buffer_ptr buffer(ggml_backend_alloc_ctx_tensors(tensors.get(), backend.get()));
+    const llama_token ids[] = {1, 2, 3, 4, 5, 6, 7, 8};
+    ggml_backend_tensor_set(token_ids, ids + 2, 0, ggml_nbytes(token_ids));
+    auto * model = params.model.get();
+    const auto n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
+    const auto n_embd = llama_model_n_embd(model);
+    const auto n_layer = llama_model_n_layer(model);
+    const std::vector<int32_t> layers = {(int32_t) n_layer, 1, (int32_t) n_layer / 2};
+    for (int n_ubatch : {4, 16}) {
+        auto cparams = llama_context_default_params();
+        cparams.n_ctx = 128;
+        cparams.n_batch = 16;
+        cparams.n_ubatch = n_ubatch;
+        llama_context_ptr ctx(llama_init_from_model(model, cparams));
+        GGML_ASSERT(ctx);
+        if (!llama_supports_gpu_sampling(ctx.get())) {
+            return;
+        }
+        for (auto layer : layers) { llama_set_embeddings_layer_inp(ctx.get(), layer, true); }
+        common_batch batch(ctx.get());
+        for (int i = 0; i < 8; ++i) { batch.add(ids[i], i, 0, i == 7); }
+        GGML_ASSERT(llama_process(ctx.get(), LLAMA_PROCESS_TYPE_DECODE, batch.get()) == 0);
+        llama_synchronize(ctx.get());
+        const auto * logits = llama_get_logits_ith(ctx.get(), -1);
+        const std::vector<float> reference(logits, logits + n_vocab);
+        std::vector<std::vector<float>> reference_features;
+        for (auto layer : layers) {
+            const auto * host = llama_get_embeddings_layer_inp(ctx.get(), layer);
+            reference_features.emplace_back(host, host + 8 * n_embd);
+        }
+        llama_memory_clear(llama_get_memory(ctx.get()), true);
+        batch.clear();
+        for (int i = 0; i < 8; ++i) { batch.add(i < 2 ? ids[i] : 0, i, 0, i == 7); }
+        GGML_ASSERT(llama_set_layer_inputs_device(ctx.get(), layers));
+        GGML_ASSERT(llama_set_device_embeddings(ctx.get(), true));
+        auto * input = batch.get();
+        GGML_ASSERT(llama_batch_ext_set_tokens_device(input, token_ids, backend.get(), 2));
+        GGML_ASSERT(llama_process(ctx.get(), LLAMA_PROCESS_TYPE_DECODE, input) == 0);
+        logits = llama_get_logits_ith(ctx.get(), -1);
+        double error = 0.0;
+        double norm = 0.0;
+        for (int id = 0; id < n_vocab; ++id) {
+            error += std::pow(logits[id] - reference[id], 2);
+            norm += std::pow(reference[id], 2);
+        }
+        GGML_ASSERT(error / norm < 1e-8);
+        ggml_backend_t features_backend = nullptr;
+        auto * packed = llama_get_layer_inputs_device(ctx.get(), 8, features_backend);
+        GGML_ASSERT(packed && packed->ne[0] == (int64_t) layers.size() * n_embd);
+        std::vector<float> values(ggml_nelements(packed));
+        ggml_backend_tensor_get(packed, values.data(), 0, ggml_nbytes(packed));
+        for (size_t layer = 0; layer < layers.size(); ++layer) {
+            const auto * host = llama_get_embeddings_layer_inp(ctx.get(), layers[layer]);
+            error = norm = 0.0;
+            for (int row = 0; row < 8; ++row) {
+                const auto * device_row = values.data() + (row * layers.size() + layer) * n_embd;
+                GGML_ASSERT(std::equal(host + row * n_embd, host + (row + 1) * n_embd, device_row));
+                for (int col = 0; col < n_embd; ++col) {
+                    error += std::pow(device_row[col] - reference_features[layer][row * n_embd + col], 2);
+                    norm += std::pow(reference_features[layer][row * n_embd + col], 2);
+                }
+            }
+            GGML_ASSERT(error / norm < 1e-8);
+        }
+    }
+    printf("device token inputs, split batches and packed target features PASSED\n");
+}
+
 static void test_dspark_markov_sampling(const test_params & params) {
     auto * model = params.model.get();
     const uint32_t count_w1 = llama_model_get_dspark_markov_w1(model, nullptr);
@@ -1871,6 +1947,7 @@ static void test_dspark_markov_sampling(const test_params & params) {
     GGML_ASSERT(ctx);
     llama_set_dspark_probabilistic(ctx.get(), true);
     llama_set_probs_device(ctx.get(), true);
+    llama_set_tokens_device(ctx.get(), true);
     common_batch batch(ctx.get());
     for (int i = 0; i < n_rows; ++i) {
         batch.add(i == 0 ? 1 : llama_vocab_mask(llama_model_get_vocab(model)), i, 0, true);
@@ -1926,6 +2003,12 @@ static void test_dspark_markov_sampling(const test_params & params) {
     std::vector<float> after_injection(retained.size());
     ggml_backend_tensor_get(llama_get_probs_device(ctx.get()), after_injection.data(), 0, after_injection.size() * sizeof(float));
     GGML_ASSERT(retained == after_injection);
+    ggml_backend_t token_backend = nullptr;
+    auto * retained_tokens = llama_get_tokens_device(ctx.get(), token_backend);
+    GGML_ASSERT(retained_tokens && retained_tokens->type == GGML_TYPE_I32);
+    std::vector<llama_token> token_copy(n_rows);
+    ggml_backend_tensor_get(retained_tokens, token_copy.data(), 0, token_copy.size() * sizeof(llama_token));
+    GGML_ASSERT(token_copy.back() == previous);
     batch.clear();
     for (int i = 0; i < n_rows; ++i) {
         batch.add(i == 0 ? 1 : llama_vocab_mask(llama_model_get_vocab(model)), 6 + i, 0, true);
@@ -1957,6 +2040,7 @@ static void test_gpu_rejection(const test_params &) {
     const int n_rows = 4;
     auto * logits = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, n_vocab, n_rows);
     auto * q = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, n_vocab, n_rows - 1);
+    auto * draft_ids = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I32, n_rows - 1);
     ggml_backend_buffer_ptr buffer(ggml_backend_alloc_ctx_tensors(ctx.get(), backend.get()));
     std::vector<float> values(n_vocab * n_rows, -INFINITY);
     std::vector<float> draft_q(n_vocab * (n_rows - 1), 0.0f);
@@ -2069,12 +2153,22 @@ static void test_gpu_rejection(const test_params &) {
                                 break;
                             }
                             ggml_sample_result result = {};
-                            GGML_ASSERT(sample(backend.get(), logits, q, &params, &result));
+                            GGML_ASSERT(sample(backend.get(), logits, q, nullptr, &params, &result));
                             GGML_ASSERT(result.n_tokens == (int) expected.size());
                             GGML_ASSERT(std::equal(expected.begin(), expected.end(), result.tokens));
+                            if (trial == 0) {
+                                ggml_backend_tensor_set(draft_ids, params.draft, 0, ggml_nbytes(draft_ids));
+                                int saved[n_rows - 1];
+                                std::copy(params.draft, params.draft + n_rows - 1, saved);
+                                std::fill(params.draft, params.draft + n_rows - 1, -1);
+                                GGML_ASSERT(sample(backend.get(), logits, q, draft_ids, &params, &result));
+                                GGML_ASSERT(result.n_tokens == (int) expected.size());
+                                GGML_ASSERT(std::equal(expected.begin(), expected.end(), result.tokens));
+                                std::copy(saved, saved + n_rows - 1, params.draft);
+                            }
                             ++accepted_lengths[result.n_tokens - 1];
                             params.n_draft = 0;
-                            GGML_ASSERT(sample(backend.get(), logits, nullptr, &params, &result));
+                            GGML_ASSERT(sample(backend.get(), logits, nullptr, nullptr, &params, &result));
                             GGML_ASSERT(result.n_tokens == 1);
                             double threshold = params.uniforms[0];
                             for (size_t i = 0; i < ids[0].size(); ++i) {
@@ -2094,7 +2188,7 @@ static void test_gpu_rejection(const test_params &) {
     for (int count : accepted_lengths) { GGML_ASSERT(count > 0); }
     ggml_sample_params invalid = {};
     ggml_sample_result result = {};
-    GGML_ASSERT(!sample(backend.get(), logits, nullptr, &invalid, &result));
+    GGML_ASSERT(!sample(backend.get(), logits, nullptr, nullptr, &invalid, &result));
     printf("GPU top-p, temperature and rejection sampling CPU reference PASSED\n");
 }
 
@@ -2423,6 +2517,7 @@ static const backend_test_case BACKEND_TESTS[] = {
     { "test_multi_output_multi_sequence_dist_packed", test_multi_output_multi_sequence_dist_packed, true },
     { "test_multi_output_dist_transaction",       test_multi_output_dist_transaction,    true },
     { "test_gpu_rejection",                       test_gpu_rejection,                    true },
+    { "test_device_inputs",                       test_device_inputs,                    true },
     { "test_dspark_markov_sampling",              test_dspark_markov_sampling,           true },
     { "test_multi_output_sampling_chain",         test_multi_output_sampling_chain,      true },
     { "test_multi_output_sampling_chain_packed_fallback", test_multi_output_sampling_chain_packed_fallback, true },

@@ -94,6 +94,27 @@ bool llama_batch_allocr::init(
     const bool has_token = n_tok_only  > 0 || n_both > 0;
     const bool has_embd  = n_embd_only > 0 || n_both > 0;
 
+    if (batch_inp.tokens_device) {
+        if (!has_token || has_embd || mixed || batch_inp.tokens_device_begin > (uint32_t) n_tok) {
+            return false;
+        }
+        tokens_device = batch_inp.tokens_device;
+        tokens_backend = batch_inp.tokens_backend;
+        tokens_device_begin = batch_inp.tokens_device_begin;
+    }
+
+    if (batch_inp.embd_device) {
+        const auto * tensor = batch_inp.embd_device;
+        if (!batch_inp.embd_backend || !has_embd || has_token || mixed ||
+                tensor->type != GGML_TYPE_F32 || !ggml_is_contiguous(tensor) ||
+                tensor->ne[0] != n_embd || tensor->ne[1] != n_tok || tensor->ne[2] != 1 || tensor->ne[3] != 1) {
+            LLAMA_LOG_ERROR("%s: invalid device embedding batch\n", __func__);
+            return false;
+        }
+        embd_device = batch_inp.embd_device;
+        embd_backend = batch_inp.embd_backend;
+    }
+
     if (mixed) {
         is_embd_vec.resize(n_tok);
         for (int32_t i = 0; i < n_tok; ++i) {
@@ -129,7 +150,7 @@ bool llama_batch_allocr::init(
                 std::copy(src, src + n_embd, embd_vec.data() + (size_t) i*n_embd);
             }
         }
-    } else if (has_embd) {
+    } else if (has_embd && !embd_device) {
         embd_vec = batch_inp.embd;
     }
 
@@ -230,6 +251,9 @@ bool llama_batch_allocr::init(
     batch.n_tokens = n_tok;
     batch.token    = has_token ? token_vec.data() : nullptr;
     batch.embd     = has_embd  ? embd_vec.data()  : nullptr;
+    if (embd_device) {
+        batch.embd = (float *) embd_device->data;
+    }
     batch.pos      = pos.data();
     batch.n_seq_id = n_seq_id.data();
     batch.seq_id   = seq_id.data();
@@ -833,6 +857,11 @@ void llama_batch_allocr::clear() {
     n_outputs = 0;
 
     batch = {};
+    embd_device = nullptr;
+    embd_backend = nullptr;
+    tokens_device = nullptr;
+    tokens_backend = nullptr;
+    tokens_device_begin = 0;
 
     token_vec   .clear();
     embd_vec    .clear();
@@ -882,7 +911,7 @@ llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, u
     const bool use_embd  = batch.embd  && !(mixed_batch && n_embd_rows == 0);
     const bool has_state = !state_vec.empty();
 
-    const int64_t n_embd_all  = use_embd  ? (int64_t) n_tokens*n_embd       : 0;
+    const int64_t n_embd_all  = use_embd && !embd_device ? (int64_t) n_tokens*n_embd : 0;
     const int64_t n_state_all = has_state ? (int64_t) n_tokens*n_embd_state : 0;
     const int64_t n_pos_all   =             (int64_t) n_tokens*n_pos_per_embd;
 
@@ -908,7 +937,7 @@ llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, u
             udata->token[i] = batch.token[idxs[i]];
         }
 
-        if (use_embd) {
+        if (use_embd && !embd_device) {
             memcpy(udata->embd.data() + i*n_embd, batch.embd + (int64_t) idxs[i]*n_embd, n_embd*sizeof(float));
         }
 
@@ -977,6 +1006,28 @@ llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, u
         /*.decision_order =*/ udata->decision_order.empty() ? nullptr : udata->decision_order.data(),
         /*.data         =*/ std::move(udata),
     };
+
+    if (embd_device) {
+        for (size_t i = 0; i < idxs.size(); ++i) {
+            GGML_ASSERT(idxs[i] == idxs[0] + (int32_t) i && "device embedding rows must be contiguous");
+        }
+        res.data->embd_device_metadata = std::make_shared<ggml_tensor>(*embd_device);
+        res.embd_device = res.data->embd_device_metadata.get();
+        res.embd_backend = embd_backend;
+        res.embd_device_offset = idxs[0];
+        res.embd = (float *) embd_device->data;
+    }
+
+    if (tokens_device) {
+        for (size_t i = 0; i < idxs.size(); ++i) {
+            GGML_ASSERT(idxs[i] == idxs[0] + (int32_t) i && "device token rows must be contiguous");
+        }
+        res.data->tokens_device_metadata = std::make_shared<ggml_tensor>(*tokens_device);
+        res.tokens_device = res.data->tokens_device_metadata.get();
+        res.tokens_backend = tokens_backend;
+        res.tokens_device_begin = std::min(n_tokens, tokens_device_begin > (uint32_t) idxs[0] ? tokens_device_begin - idxs[0] : 0);
+        res.tokens_device_offset = (uint32_t) idxs[0] > tokens_device_begin ? idxs[0] - tokens_device_begin : 0;
+    }
 
     if (debug > 0) {
         LLAMA_LOG_DEBUG("%s: added ubatch to split:\n", __func__);
@@ -1190,6 +1241,11 @@ void llama_batch_ext::clear() {
     embd  .clear();
     state .clear();
     n_embd = 0;
+    embd_device = nullptr;
+    embd_backend = nullptr;
+    tokens_device = nullptr;
+    tokens_backend = nullptr;
+    tokens_device_begin = 0;
 }
 
 int32_t llama_batch_ext::add_token(llama_seq_id seq_id) {
@@ -1387,6 +1443,41 @@ bool llama_batch_ext_set_pos(llama_batch_ext * batch, int32_t idx, const llama_p
 
 bool llama_batch_ext_set_embd_token(llama_batch_ext * batch, int32_t idx, llama_embd embd) {
     return batch->set_token_embd(idx, embd);
+}
+
+bool llama_batch_ext_set_embd_device(llama_batch_ext * batch, ggml_tensor * tensor, ggml_backend_t backend) {
+    if (!batch || !tensor || !backend || !tensor->buffer || !tensor->data ||
+            tensor->type != GGML_TYPE_F32 || !ggml_is_contiguous(tensor) ||
+            tensor->ne[1] != (int64_t) batch->tokens.size() || tensor->ne[2] != 1 || tensor->ne[3] != 1 ||
+            (tensor->ne[0] != (int64_t) batch->n_embd_inp && tensor->ne[0] != (int64_t) batch->n_embd_inp_enc)) {
+        return false;
+    }
+    for (auto & token : batch->tokens) {
+        token.id = LLAMA_TOKEN_NULL;
+        token.has_embd = true;
+    }
+    batch->n_embd = tensor->ne[0];
+    batch->embd_device = tensor;
+    batch->embd_backend = backend;
+    batch->embd.clear();
+    return true;
+}
+
+bool llama_batch_ext_set_tokens_device(llama_batch_ext * batch, ggml_tensor * tensor, ggml_backend_t backend, uint32_t begin) {
+    if (!batch || !tensor || !backend || !tensor->buffer || !tensor->data || tensor->type != GGML_TYPE_I32 ||
+            !ggml_is_contiguous(tensor) || begin >= batch->tokens.size() ||
+            ggml_nelements(tensor) < (int64_t) (batch->tokens.size() - begin)) {
+        return false;
+    }
+    for (const auto & token : batch->tokens) {
+        if (token.has_embd || token.id == LLAMA_TOKEN_NULL) {
+            return false;
+        }
+    }
+    batch->tokens_device = tensor;
+    batch->tokens_backend = backend;
+    batch->tokens_device_begin = begin;
+    return true;
 }
 
 bool llama_batch_ext_set_embd_state(llama_batch_ext * batch, int32_t idx, llama_embd embd) {

@@ -300,6 +300,7 @@ struct server_slot {
     std::vector<int32_t> spec_i_batch;
     common_prompt_checkpoint spec_ckpt;
     bool spec_is_replay = false;
+    bool spec_tokens_pending = false;
     std::mt19937 spec_synth_rng;
 
     // TODO: move members that belong to the task (such as `generated`, `has_new_line`) to task_results_state
@@ -641,11 +642,16 @@ struct server_slot {
 
         prompt.tokens.push_back(tok_track);
         prompt.tokens.insert(spec_draft);
+        spec_tokens_pending = !spec_draft.empty() && spec && common_speculative_get_draft_params(spec, id).tokens_device;
     }
 
     void release() {
         if (is_processing()) {
             GGML_ASSERT(task);
+            if (spec_tokens_pending) {
+                prompt_clear();
+                spec_tokens_pending = false;
+            }
 
             SLT_INF(*this, "stop processing: n_tokens = %d, truncated = %d\n", prompt.n_tokens(), truncated);
 
@@ -1071,6 +1077,7 @@ private:
 
     llama_model   * model_dft = nullptr;
     llama_context * ctx_dft   = nullptr;
+    bool spec_process_deferred = false;
 
     common_speculative_init_result_ptr spec_init;
 
@@ -2028,6 +2035,10 @@ private:
             const bool need_pre_sample_logits = task.params.sampling.n_probs > 0 && !task.params.post_sampling_probs;
 
             llama_set_logits_device(ctx_tgt, common_sampler_can_gpu(slot.smpl.get(), ctx_tgt) && llama_n_seq_max(ctx_tgt) == 1);
+            llama_set_device_embeddings(ctx_tgt, common_sampler_can_gpu(slot.smpl.get(), ctx_tgt));
+            if (ctx_dft && common_speculative_has_device_probs(spec.get())) {
+                llama_share_device_embeddings(ctx_dft, ctx_tgt);
+            }
 
             bool use_backend_sampling = task.params.sampling.backend_sampling;
 
@@ -3799,10 +3810,17 @@ private:
                             /* .seed     = */ slot.task->params.sampling.seed,
                             /* .probs_device = */ common_speculative_has_device_probs(spec.get()) &&
                                 ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_FULL &&
-                                (ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_RS || common_speculative_n_max(spec.get()) <= llama_n_rs_seq(ctx_tgt)) &&
+                                (ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_RS || (uint32_t) common_speculative_n_max(spec.get()) <= llama_n_rs_seq(ctx_tgt)) &&
                                 common_sampler_can_gpu(slot.smpl.get(), slot.ctx_tgt) &&
                                 llama_n_seq_max(slot.ctx_tgt) == 1 && ctx_dft && llama_supports_gpu_sampling(ctx_dft),
                         };
+                        auto & draft_params = common_speculative_get_draft_params(spec.get(), slot.id);
+                        const char * token_mode = std::getenv("DSPARK_DEVICE_TOKENS");
+                        draft_params.tokens_device = draft_params.probs_device &&
+                            llama_device_embeddings_ready(ctx_tgt) &&
+                            common_speculative_get_synth_probs(spec.get()).empty() &&
+                            (!token_mode || std::strcmp(token_mode, "0") != 0) &&
+                            common_speculative_n_max(spec.get()) + 1 <= (int32_t) llama_n_ubatch(ctx_tgt);
 
                         drafting.push_back(&slot);
                     }
@@ -3813,7 +3831,14 @@ private:
         // generate the actual drafts (if any)
         if (!drafting.empty()) {
             queue_tasks.yield_to_queue([&]() {
+                if (drafting.size() == 1 && common_speculative_get_draft_params(spec.get(), drafting[0]->id).tokens_device) {
+                    llama_pipeline_begin(ctx_tgt, ctx_dft);
+                }
                 common_speculative_draft(spec.get());
+                if (drafting.size() != 1 || drafting[0]->spec_draft.empty() ||
+                        !common_speculative_get_draft_params(spec.get(), drafting[0]->id).tokens_device) {
+                    llama_pipeline_finish(ctx_tgt);
+                }
             });
         }
 
@@ -4591,8 +4616,31 @@ private:
         // note: the sync is done here too, so that the wait is also covered by the yield
         int ret = 0;
         queue_tasks.yield_to_queue([&]() {
-            ret = llama_process(ctx_tgt, LLAMA_PROCESS_TYPE_DECODE, batch.view.get());
-            if (ret == 0 && has_output) {
+            auto * input = batch.view.get();
+            if (spec && slots.size() == 1 && !slots[0].spec_draft.empty() && !slots[0].spec_is_replay &&
+                    common_speculative_get_draft_params(spec.get(), slots[0].id).tokens_device) {
+                ggml_backend_t backend = nullptr;
+                auto * tokens = llama_get_tokens_device(ctx_dft, backend);
+                const int32_t begin = slots[0].spec_i_batch.front() + 1 - off;
+                GGML_ASSERT(begin >= 0 && tokens);
+                if (llama_device_embeddings_ready(ctx_tgt)) {
+                    GGML_ASSERT(llama_batch_ext_set_tokens_device(input, tokens, backend, begin));
+                } else {
+                    auto & slot = slots[0];
+                    llama_synchronize(ctx_dft);
+                    ggml_backend_tensor_get(tokens, slot.spec_draft.data(), 0, slot.spec_draft.size() * sizeof(llama_token));
+                    for (size_t i = 0; i < slot.spec_draft.size(); ++i) {
+                        batch.view.tokens[begin + i].id = slot.spec_draft[i];
+                    }
+                    slot.prompt.tokens.keep_first(slot.prompt.n_tokens() - slot.spec_draft.size());
+                    slot.prompt.tokens.insert(slot.spec_draft);
+                    common_speculative_get_draft_params(spec.get(), slot.id).tokens_device = false;
+                    slot.spec_tokens_pending = false;
+                    input = batch.view.get();
+                }
+            }
+            ret = llama_process(ctx_tgt, LLAMA_PROCESS_TYPE_DECODE, input);
+            if (ret == 0 && has_output && !llama_pipeline_active(ctx_tgt)) {
                 llama_synchronize(ctx_tgt);
             }
         });
@@ -4653,7 +4701,8 @@ private:
         // TODO: avoid restoring the draft context and re-evaluating the drafted tokens when not needed [TAG_SPEC_AVOID_DRAFT_REEVAL]
         //       for now, always re-evaluate for simplicity
         //       ref: https://github.com/ggml-org/llama.cpp/pull/22728#issuecomment-4400925384
-        if (spec) {
+        spec_process_deferred = spec && slots.size() == 1 && slots[0].spec_tokens_pending && llama_pipeline_active(ctx_tgt);
+        if (spec && !spec_process_deferred) {
             bool ok = true;
             queue_tasks.yield_to_queue([&]() {
                 ok = common_speculative_process(spec.get(), batch.view);
@@ -4696,6 +4745,10 @@ private:
     }
 
     void post_decode(int32_t n_batch_tokens, int32_t off) {
+        struct pipeline_guard {
+            llama_context * ctx;
+            ~pipeline_guard() { llama_pipeline_finish(ctx); }
+        } guard{ctx_tgt};
         // for checking if a given batch index is inside the current sub-batch
         auto is_inside_view = [&](int32_t idx) {
             return idx >= off && idx < off + n_batch_tokens;
@@ -4851,12 +4904,25 @@ private:
                 } else if (slot.spec_is_replay && slot.use_spec_rejection()) {
                     accepted = server_accept_replay(slot.smpl.get(), slot.ctx_tgt, spec_i_batch, slot.spec_draft);
                 } else if (use_rejection) {
-                    accepted = common_sampler_sample_and_accept_n_rejection(slot.smpl.get(), slot.ctx_tgt, spec_i_batch, slot.spec_draft, slot.spec_draft_q, false, probs_device ? ctx_dft : nullptr);
+                    accepted = common_sampler_sample_and_accept_n_rejection(slot.smpl.get(), slot.ctx_tgt, spec_i_batch, slot.spec_draft, slot.spec_draft_q, false, probs_device ? ctx_dft : nullptr,
+                            common_speculative_get_draft_params(spec.get(), slot.id).tokens_device);
                 } else {
                     accepted = common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, spec_i_batch, slot.spec_draft);
                 }
 
                 GGML_ASSERT(accepted.size() >= 1);
+                if (spec_process_deferred) {
+                    llama_pipeline_finish(ctx_tgt);
+                    bool ok = false;
+                    queue_tasks.yield_to_queue([&]() {
+                        ok = common_speculative_process(spec.get(), batch.view);
+                    });
+                    if (!ok) {
+                        throw std::runtime_error("failed to process deferred speculative batch");
+                    }
+                    spec_process_deferred = false;
+                }
+                slot.spec_tokens_pending = false;
 
                 const uint32_t n_rollback = slot.spec_draft.size() + 1 - accepted.size();
 

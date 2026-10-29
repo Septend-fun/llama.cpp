@@ -61,6 +61,8 @@ struct llama_cparams {
     size_t moe_cache_size;
 
     std::vector<bool> embeddings_layer_inp; // [n_layer()] extract input embeddings for layer
+    std::vector<int32_t> embeddings_layer_inp_device;
+    struct ggml_tensor * token_embd_device = nullptr;
 
     enum llama_context_type ctx_type;
     enum llama_rope_scaling_type rope_scaling_type;

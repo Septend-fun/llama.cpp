@@ -10,6 +10,7 @@
 #include "ggml-cuda/argmax.cuh"
 #include "ggml-cuda/argsort.cuh"
 #include "ggml-cuda/sampling.cuh"
+#include "ggml-cuda/pipeline.cuh"
 #include "ggml-cuda/binbcast.cuh"
 #include "ggml-cuda/clamp.cuh"
 #include "ggml-cuda/col2im-1d.cuh"
@@ -835,6 +836,7 @@ static void ggml_backend_cuda_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
 }
 
 static void ggml_backend_cuda_buffer_get_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
+    ggml_cuda_pipeline_sync();
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
 
     ggml_cuda_set_device(ctx->device);
@@ -2639,6 +2641,7 @@ static const char * ggml_backend_cuda_get_name(ggml_backend_t backend) {
 
 static void ggml_backend_cuda_free(ggml_backend_t backend) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *)backend->context;
+    ggml_cuda_pipeline_cancel(cuda_ctx);
 
     delete cuda_ctx;
     delete backend;
@@ -2655,6 +2658,7 @@ static void ggml_backend_cuda_set_tensor_async(ggml_backend_t backend, ggml_tens
 
 static void ggml_backend_cuda_get_tensor_async(ggml_backend_t backend, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    ggml_cuda_pipeline_sync();
     ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
 
     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
@@ -2710,6 +2714,10 @@ static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_
         return false;
     }
 
+    if (ggml_cuda_pipeline_copy(cuda_ctx_src, cuda_ctx_dst, src->data, dst->data, ggml_nbytes(dst))) {
+        return true;
+    }
+
     if (backend_src != backend_dst) {
         // copy on src stream
         // compare the backing physical devices: distinct virtual devices may share one physical GPU,
@@ -2745,6 +2753,7 @@ static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_
 
 static void ggml_backend_cuda_synchronize(ggml_backend_t backend) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *)backend->context;
+    ggml_cuda_pipeline_sync(cuda_ctx);
 
     CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
 
@@ -2885,14 +2894,19 @@ static void ggml_cuda_graph_launch_chunk(ggml_backend_cuda_context * cuda_ctx, g
 
     if (idx < graph->instances.size()) {
         ggml_cuda_graph_update_executable(graph->instances[idx], cuda_graph);
+        CUDA_CHECK(cudaGraphDestroy(graph->sources[idx]));
+        graph->sources[idx] = cuda_graph;
+        graph->source_ids[idx] = ggml_cuda_pipeline_graph_id();
     } else {
         GGML_ASSERT(idx == graph->instances.size());
         graph->instances.emplace_back(nullptr);
         CUDA_CHECK(cudaGraphInstantiate(&graph->instances[idx], cuda_graph, nullptr, nullptr, 0));
+        graph->sources.push_back(cuda_graph);
+        graph->source_ids.push_back(ggml_cuda_pipeline_graph_id());
     }
-    CUDA_CHECK(cudaGraphDestroy(cuda_graph));
-
-    CUDA_CHECK(cudaGraphLaunch(graph->instances[idx], cuda_ctx->stream()));
+    if (!ggml_cuda_pipeline_graph(cuda_ctx, cuda_graph, graph->source_ids[idx])) {
+        CUDA_CHECK(cudaGraphLaunch(graph->instances[idx], cuda_ctx->stream()));
+    }
 }
 #endif // USE_CUDA_GRAPH
 
@@ -4853,8 +4867,11 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
             // drop the chunks left over from a longer graph
             for (size_t i = n_chunks; i < graph->instances.size(); ++i) {
                 CUDA_CHECK(cudaGraphExecDestroy(graph->instances[i]));
+                CUDA_CHECK(cudaGraphDestroy(graph->sources[i]));
             }
             graph->instances.resize(n_chunks);
+            graph->sources.resize(n_chunks);
+            graph->source_ids.resize(n_chunks);
             graph_evaluated_or_captured = true; // CUDA graph has been captured
 
             std::lock_guard<std::mutex> lock(ggml_cuda_lock);
@@ -4868,8 +4885,10 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 
     if (use_cuda_graph && !cuda_graph_update_required) {
         // the chunks were launched during capture, otherwise launch them here
-        for (cudaGraphExec_t instance : graph->instances) {
-            CUDA_CHECK(cudaGraphLaunch(instance, cuda_ctx->stream()));
+        for (size_t i = 0; i < graph->instances.size(); ++i) {
+            if (!ggml_cuda_pipeline_graph(cuda_ctx, graph->sources[i], graph->source_ids[i])) {
+                CUDA_CHECK(cudaGraphLaunch(graph->instances[i], cuda_ctx->stream()));
+            }
         }
 #else
         GGML_UNUSED(graph_key);
@@ -4943,6 +4962,10 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     }
 #endif // USE_CUDA_GRAPH
 
+    if (!use_cuda_graph) {
+        ggml_cuda_pipeline_cancel(cuda_ctx);
+    }
+
     if (use_cuda_graph && cuda_graph_update_required) {
         // Start CUDA graph capture
         {
@@ -4961,11 +4984,17 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
 static void ggml_backend_cuda_event_record(ggml_backend_t backend, ggml_backend_event_t event) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *)backend->context;
 
-    CUDA_CHECK(cudaEventRecord((cudaEvent_t)event->context, cuda_ctx->stream()));
+    if (!ggml_cuda_pipeline_event(cuda_ctx, (cudaEvent_t) event->context)) {
+        CUDA_CHECK(cudaEventRecord((cudaEvent_t)event->context, cuda_ctx->stream()));
+    }
 }
 
 static void ggml_backend_cuda_event_wait(ggml_backend_t backend, ggml_backend_event_t event) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *)backend->context;
+
+    if (ggml_cuda_pipeline_active(cuda_ctx)) {
+        return;
+    }
 
     if (ggml_backend_is_cuda(backend)) {
         CUDA_CHECK(cudaStreamWaitEvent(cuda_ctx->stream(), (cudaEvent_t)event->context, 0));
@@ -6171,6 +6200,7 @@ static void ggml_backend_cuda_device_event_free(ggml_backend_dev_t dev, ggml_bac
 
 static void ggml_backend_cuda_device_event_synchronize(ggml_backend_dev_t dev, ggml_backend_event_t event) {
     GGML_UNUSED(dev);
+    ggml_cuda_pipeline_event_sync((cudaEvent_t) event->context);
     CUDA_CHECK(cudaEventSynchronize((cudaEvent_t)event->context));
 }
 
@@ -6272,23 +6302,50 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t 
 }
 
 static bool ggml_backend_cuda_sample(ggml_backend_t backend, const ggml_tensor * logits,
-        const ggml_tensor * draft_probs, const ggml_sample_params * params, ggml_sample_result * result) {
+        const ggml_tensor * draft_probs, const ggml_tensor * draft_tokens, const ggml_sample_params * params, ggml_sample_result * result) {
     if (!ggml_backend_is_cuda(backend) || !logits || !logits->buffer) {
         return false;
     }
     const auto device = ggml_backend_get_device(backend);
-    for (const auto * tensor : {logits, draft_probs}) {
+    for (const auto * tensor : {logits, draft_probs, draft_tokens}) {
         if (tensor && (!tensor->buffer || ggml_backend_buft_get_device(ggml_backend_buffer_get_type(tensor->buffer)) != device)) {
             return false;
         }
     }
-    return ggml_cuda_sample(*(ggml_backend_cuda_context *) backend->context, logits, draft_probs, params, result);
+    return ggml_cuda_sample(*(ggml_backend_cuda_context *) backend->context, logits, draft_probs, draft_tokens, params, result);
+}
+
+static bool ggml_backend_cuda_pipeline_begin(ggml_backend_t target, ggml_backend_t draft) {
+    if (!ggml_backend_is_cuda(target) || !ggml_backend_is_cuda(draft)) {
+        return false;
+    }
+    return ggml_cuda_pipeline_begin(*(ggml_backend_cuda_context *) target->context,
+            *(ggml_backend_cuda_context *) draft->context);
+}
+
+static bool ggml_backend_cuda_pipeline_active(ggml_backend_t backend) {
+    return ggml_backend_is_cuda(backend) && ggml_cuda_pipeline_active((ggml_backend_cuda_context *) backend->context);
+}
+
+static void ggml_backend_cuda_pipeline_finish(ggml_backend_t backend) {
+    if (ggml_backend_is_cuda(backend)) {
+        ggml_cuda_pipeline_finish((ggml_backend_cuda_context *) backend->context);
+    }
 }
 
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
     if (strcmp(name, "ggml_backend_sample") == 0) {
         return (void *) ggml_backend_cuda_sample;
+    }
+    if (strcmp(name, "ggml_backend_pipeline_begin") == 0) {
+        return (void *) ggml_backend_cuda_pipeline_begin;
+    }
+    if (strcmp(name, "ggml_backend_pipeline_active") == 0) {
+        return (void *) ggml_backend_cuda_pipeline_active;
+    }
+    if (strcmp(name, "ggml_backend_pipeline_finish") == 0) {
+        return (void *) ggml_backend_cuda_pipeline_finish;
     }
     if (strcmp(name, "ggml_backend_comm_init") == 0) {
         return (void *)ggml_backend_cuda_comm_init;

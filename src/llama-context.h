@@ -124,9 +124,22 @@ struct llama_context {
     bool sample_gpu(llama_context * draft, const std::vector<int> & idxs,
             ggml_sample_params params, ggml_sample_result & result);
     void set_probs_device(bool value) { sampling.probs_device = value; }
+    void set_tokens_device(bool value) { sampling.tokens_device = value && sampling.probs_device; }
+    ggml_tensor * get_tokens_device(ggml_backend_t & backend) const {
+        backend = sampling.tokens_backend;
+        return sampling.tokens_valid ? sampling.tokens_tensor : nullptr;
+    }
     void set_logits_device(bool value) { sampling.logits_device = value; }
     ggml_tensor * get_probs_device() const { return sampling.probs_valid ? sampling.probs_tensor : nullptr; }
     void set_embeddings_layer_inp(uint32_t lid, bool enable);
+    bool set_layer_inputs_device(const std::vector<int32_t> & layers);
+    ggml_tensor * get_layer_inputs_device(uint32_t n_tokens, ggml_backend_t & backend);
+    bool set_device_embeddings(bool value);
+    bool device_embeddings_ready() const;
+    void share_device_embeddings(llama_context * target);
+    bool begin_pipeline(llama_context * draft);
+    bool pipeline_active() const;
+    void finish_pipeline();
     void set_nextn_layer_offset(int32_t offset);
     void set_causal_attn(bool value);
     void set_warmup(bool value);
@@ -249,7 +262,7 @@ private:
 
     // async-copy enabled layer-input tensors (per cparams.output_layer_inp)
     // from backend into host-side embd_layer_inp buffers
-    bool extract_layer_inputs(const llm_graph_result * res, size_t token_offset, size_t n_tokens);
+    bool extract_layer_inputs(const llm_graph_result * res, size_t token_offset, size_t n_tokens, bool defer = false);
 
     //
     // graph
@@ -333,11 +346,27 @@ private:
     // populated when cparams.output_layer_inp[il] is true
     std::vector<buffer_view<float>> embd_layer_inp;
     std::vector<int32_t> embd_batch_idxs; // extracted index -> original batch index
+    bool layer_inputs_pending = false;
+    bool layer_inputs_stored = false;
+    uint32_t layer_inputs_rows = 0;
+    ggml_context_ptr layer_inputs_ctx;
+    ggml_backend_buffer_ptr layer_inputs_buffer;
+    ggml_tensor * layer_inputs_tensor = nullptr;
+    ggml_tensor layer_inputs_view = {};
+    ggml_backend_t layer_inputs_backend = nullptr;
+    ggml_context_ptr device_embd_ctx;
+    ggml_backend_buffer_ptr device_embd_buffer;
+    ggml_tensor * device_embd_tensor = nullptr;
 
     struct sampling_info {
         bool probs_device = false;
         bool probs_pending = false;
         bool probs_valid = false;
+        bool tokens_device = false;
+        bool tokens_valid = false;
+        bool tokens_pending = false;
+        ggml_tensor * tokens_tensor = nullptr;
+        ggml_backend_t tokens_backend = nullptr;
         bool logits_device = false;
         bool logits_pending = false;
         ggml_context_ptr probs_ctx;

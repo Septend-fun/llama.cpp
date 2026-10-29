@@ -146,6 +146,7 @@ public:
     ggml_tensor * mixed_slots  = nullptr; // I64 [n_tok_rows], mixed path: batch index of the token rows
     ggml_tensor * mixed_embd   = nullptr; // F32 [n_embd, n_batch], mixed path: embd rows, token rows are overwritten
     ggml_tensor * scale_rows   = nullptr; // F32 [1, n_batch], per-row scale: scale_tok for token rows, 1 for embd rows
+    ggml_backend_t backend = nullptr;
 
     float scale_tok = 1.0f;
 
@@ -837,6 +838,14 @@ struct llm_graph_params {
     // return true if the "other" params would result in a graph with the same topology as with the current params
     //   having the same topology allows us to reuse the graph in some cases
     bool allow_reuse(const llm_graph_params & other) const {
+        if ((!ubatch.embd_device != !other.ubatch.embd_device) ||
+                ubatch.embd_backend != other.ubatch.embd_backend ||
+                (!ubatch.tokens_device != !other.ubatch.tokens_device) ||
+                ubatch.tokens_backend != other.ubatch.tokens_backend ||
+                cparams.token_embd_device != other.cparams.token_embd_device ||
+                cparams.embeddings_layer_inp_device != other.cparams.embeddings_layer_inp_device) {
+            return false;
+        }
         // first check the ubatch
         bool can_reuse_ubatch =
             ubatch.equal_seqs() == other.ubatch.equal_seqs() &&
@@ -970,6 +979,7 @@ public:
     ggml_tensor * t_embd        = nullptr;
     ggml_tensor * t_embd_pooled = nullptr;
     ggml_tensor * t_h_nextn     = nullptr; // [n_embd, n_outputs] hidden state before final output norm
+    ggml_tensor * t_layer_inp_packed = nullptr;
 
     std::vector<ggml_tensor *> t_layer_inp;
 
@@ -1477,6 +1487,7 @@ struct llm_graph_context {
     //
 
     void build_sampling() const;
+    void build_layer_inputs() const;
 
     //
     // dense (out)

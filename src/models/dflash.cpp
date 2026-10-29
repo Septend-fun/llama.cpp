@@ -548,7 +548,19 @@ static void build_dspark_block_mask(llm_graph_context & g, ggml_tensor *& mask) 
     }
 
     const int64_t block_size = g.n_tokens / n_blocks;
-    if (block_size <= 1 || g.n_tokens % n_blocks != 0 || mask->ne[2] != 1 || mask->ne[1] % block_size != 0 || !ggml_is_contiguous(mask)) {
+    if (block_size <= 1 || g.n_tokens % n_blocks != 0 || mask->ne[2] != 1 || !ggml_is_contiguous(mask)) {
+        return;
+    }
+
+    const char * shared_mask = std::getenv("DSPARK_SHARED_HISTORY_MASK");
+    if (n_blocks == 1 && mask->ne[3] == 1 && g.cparams.token_embd_device && g.cparams.flash_attn && mask->type == GGML_TYPE_F16 &&
+            (!shared_mask || std::strcmp(shared_mask, "0") != 0)) {
+        mask = ggml_view_4d(g.ctx0, mask, mask->ne[0], 1, 1, 1, 0, 0, 0, 0);
+        g.cb(mask, "dspark_shared_history_mask", -1);
+        return;
+    }
+
+    if (mask->ne[1] % block_size != 0) {
         return;
     }
 
@@ -1006,7 +1018,7 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
     }
 
     // tok_embd from the target model (shared via ctx_other)
-    auto * tok_embd = model.tok_embd;
+    auto * tok_embd = cparams.token_embd_device ? cparams.token_embd_device : model.tok_embd;
     if (tok_embd == nullptr) {
         GGML_ASSERT(cparams.ctx_other != nullptr);
         const auto * model_other = llama_get_model(cparams.ctx_other);
@@ -1270,7 +1282,7 @@ llama_model_dflash::graph_dsv4::graph_dsv4(const llama_model & model, const llm_
     }
 
     // tok_embd from the target model (shared via ctx_other)
-    auto * tok_embd = model.tok_embd;
+    auto * tok_embd = cparams.token_embd_device ? cparams.token_embd_device : model.tok_embd;
     if (tok_embd == nullptr) {
         GGML_ASSERT(cparams.ctx_other != nullptr);
         const auto * model_other = llama_get_model(cparams.ctx_other);
@@ -1445,7 +1457,7 @@ llama_model_dflash::graph_dsv41::graph_dsv41(const llama_model & model, const ll
         return;
     }
 
-    auto * tok_embd = model.tok_embd;
+    auto * tok_embd = cparams.token_embd_device ? cparams.token_embd_device : model.tok_embd;
     if (tok_embd == nullptr) {
         GGML_ASSERT(cparams.ctx_other != nullptr);
         const auto * model_other = llama_get_model(cparams.ctx_other);

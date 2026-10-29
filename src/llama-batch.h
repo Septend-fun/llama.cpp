@@ -76,10 +76,20 @@ struct llama_ubatch {
         std::vector<int32_t>        decision_order;
 
         std::vector<llama_seq_id> seq_id_data;
+        std::shared_ptr<ggml_tensor> embd_device_metadata;
+        std::shared_ptr<ggml_tensor> tokens_device_metadata;
     };
 
     // the llama_ubatch pointers above point to this data if set. otherwise - point to external non-owning data
     std::shared_ptr<data_t> data;
+
+    ggml_tensor * embd_device = nullptr;
+    ggml_backend_t embd_backend = nullptr;
+    uint32_t embd_device_offset = 0;
+    ggml_tensor * tokens_device = nullptr;
+    ggml_backend_t tokens_backend = nullptr;
+    uint32_t tokens_device_begin = 0;
+    uint32_t tokens_device_offset = 0;
 };
 
 // crash if a mixed ubatch reaches code that expects only tokens or only embd
@@ -122,6 +132,13 @@ struct llama_batch_ext {
     std::vector<token> tokens;
     std::vector<float> embd;
     std::vector<float> state;
+
+    ggml_tensor * embd_device = nullptr;
+    ggml_backend_t embd_backend = nullptr;
+
+    ggml_tensor * tokens_device = nullptr;
+    ggml_backend_t tokens_backend = nullptr;
+    uint32_t tokens_device_begin = 0;
 
     llama_batch_ext(llama_context * ctx);
 
@@ -204,6 +221,11 @@ private:
     void ubatch_print(const llama_ubatch & ubatch, int debug);
 
     llama_batch batch;
+    ggml_tensor * embd_device = nullptr;
+    ggml_backend_t embd_backend = nullptr;
+    ggml_tensor * tokens_device = nullptr;
+    ggml_backend_t tokens_backend = nullptr;
+    uint32_t tokens_device_begin = 0;
 
     // only for debugging purposes
     const llama_vocab * vocab;
